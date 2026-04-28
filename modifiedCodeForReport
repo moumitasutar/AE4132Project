@@ -1,0 +1,666 @@
+clear
+clearvars
+close all
+
+%% Spaceship Layout Properties
+
+% Important:
+% The report describes the ship dimensions in km because this is a generation ship scale problem.
+% However, the thermal material properties and heat loads are in SI units, so the FEM calculation
+% should be completed in meters. The plotScale variable is only used to plot the figures in km.
+
+innerRadius = 10e3;   % m
+outerRadius = 20e3;   % m
+numRadial = 20;       % number of radial divisions
+numTheta  = 20;       % number of angular divisions
+t = 1e3;              % thickness (m)
+
+%% Material Properties
+
+sigma = 5.67 .* 10 .^ -8; % Stephan-Boltzman constant (W/(m^2*K^4))
+epsilon = 0.5;            % Emissivity of material 
+k = 21.9;                 % thermal conductivity (W/(m*K))
+alpha = 23e-6;            % coefficient of thermal expansion (1/K)
+
+%% Heat Properties
+
+Tspace = 300;                         % Temperature of outer space/radiator reference (K)
+
+% These values represent shielded and volume-averaged thermal loads. The raw values from the
+% first model were too large for a kilometer-scale habitat volume and produced nonphysical
+% temperatures. These values are better for a first design-level thermal screen.
+
+Q  = 1e-5;                            % volume-averaged heat generation from habitat (W/m^3)
+qIn = 0.1;                            % shielded heat flux in from nuclear plant (W/m^2)
+
+% Instead of treating radiation as a constant outward flux, this model uses a
+% linearized radiation boundary condition:
+%
+% q_rad = hRad * (T - Tspace)
+%
+% This is useful because it gives the system a temperature reference without
+% needing to prescribe fixed temperature nodes.
+
+hRad = 4 * epsilon * sigma * Tspace ^ 3; % linearized radiation coefficient (W/(m^2*K))
+
+%% Graph Properties 
+
+offset = 0.2;                          % Offset for the node number in the plots (visual effect only)
+plotScale = 1e-3;                      % Converts m to km for report figures
+
+%% Mesh Generation
+
+% Angular divisions 
+theta = linspace(0, 2*pi, numTheta+1);
+theta = theta(1:end-1);
+
+% Radial divisions
+r = sqrt(linspace(innerRadius^2, outerRadius^2, numRadial+1));
+
+% Create a mesh based on the following elements
+[Theta, R] = meshgrid(theta, r);
+X = R .* cos(Theta);
+Y = R .* sin(Theta);
+
+% nodes is a (N x 2) matrix of node coordinates in Cartesian coords
+% For a given radial station i and theta location j, nodeID(i, j) returns 
+% the node number that can be used to index the nodes table 
+nodes = [Y(:), X(:)];                 
+nodeID = reshape(1:numel(X), size(X)); 
+
+% Element Table
+numNodes = size(nodes,1);           % Number of nodes in the mesh
+numElements = numRadial * numTheta; % Number of elements in the mesh
+elements = zeros(numElements, 5);   
+
+%{
+Each row of the element matrix corresponds to an element in the mesh. Each
+column corresponds to a node in the quadliteral element. Figure 1.
+
+n2 (i+1,j) ---- n3 (i,j+1)
+     |              |
+     |              |
+n1 (i,j) -----  n4 (i+1,j+1)
+
+The fifth element indicates if the element has a boundary heat flux applied to it
+%}
+currElemNumber = 1;
+for i = 1:numRadial
+    for j = 1:numTheta
+
+        jp1 = j + 1;
+        if (jp1 > numTheta)
+            jp1 = 1;
+        end
+
+        n1 = nodeID(i, j);      % node 1 is bottom left
+        n2 = nodeID(i+1, j);    % node 2 is top left
+        n3 = nodeID(i+1, jp1);  % node 3 is top right
+        n4 = nodeID(i, jp1);    % node 4 is bottom right 
+
+        %{
+        1 = inner ring (imposed heat flux in)
+        2 = outer ring (radiation heat loss)
+        3 = in between inner and outer (no imposed boundary heat flux)
+        %}
+
+        if (i == 1)
+            % All elements at radial station 1 have an imposed heat flux into 
+            % the element from the reactor.
+            elements(currElemNumber,:) = [n1, n2, n3, n4, 1];
+        elseif (i == numRadial)
+            % All elements at radial station numRadial have heat leaving 
+            % the element and heading into space via radiation. 
+            elements(currElemNumber,:) = [n1, n2, n3, n4, 2];
+        else
+            % All other elements have no imposed boundary heat flux
+            elements(currElemNumber,:) = [n1, n2, n3, n4, 3];
+        end
+
+        currElemNumber = currElemNumber + 1;
+    end
+end
+
+%% Isoparameteric Mapping
+
+K = zeros(numNodes, numNodes); % Global stiffness matrix
+R = zeros(numNodes, 1);        % Global load vector
+
+% Shape Functions
+
+% N_1(zeta, eta) = 1/4 * (1 - zeta) * (1 - eta) = 1/4 * (1 - zeta - eta + zeta*eta)
+% N_2(zeta, eta) = 1/4 * (1 - zeta) * (1 + eta) = 1/4 * (1 - zeta + eta - zeta*eta)
+% N_3(zeta, eta) = 1/4 * (1 + zeta) * (1 + eta) = 1/4 * (1 + zeta + eta + zeta*eta)
+% N_4(zeta, eta) = 1/4 * (1 + zeta) * (1 - eta) = 1/4 * (1 + zeta - eta - zeta*eta)
+
+% Lambda is our conductivity matrix. The first element and the last element typically
+% indicate the conductivity in the x and y directions, but in this case they are the same
+% as the material is the same throughout the structure
+lambda = [k, 0
+          0, k];
+
+% This gives the gauss points for a 4-node quad element. Each row corresponds to a particular node
+% number. For example, node 1 while being located in reality at zeta = -1, eta = -1, will be located
+% at zeta = -1/sqrt(3) and eta = -1/sqrt(3) for the purposes of guass-quadrature intergration. Node
+% 2 is located at zeta = -1, eta = 1 and therefore the gauss point will be at zeta = -1/sqrt(3) and
+% eta = 1/sqrt(3). The local node number, as shown in the Figure 1 above, is the index into this
+% table. Since we are using a 2-point Gauss quadrature rule the weight is equal to 1.
+%{
+Natural coordinate space (zeta, eta): 
+Figure 2
+   η
+   ↑
+   |   Node 2 (-1,+1)        Node 3 (+1,+1)
+   |        ●----------------●
+   |        |                |
+   |        |    •     •     |   ← Gauss points (±0.577)
+   |        |                |
+   |        |    •     •     |
+   |        |                |
+   |        ●----------------●
+   |   Node 1 (-1,-1)        Node 4 (+1,-1)
+   |
+   +------------------------------→ ζ
+%}
+gaussTable2D = [-1/sqrt(3), -1/sqrt(3)
+                -1/sqrt(3),  1/sqrt(3)
+                 1/sqrt(3),  1/sqrt(3)
+                 1/sqrt(3), -1/sqrt(3)];
+
+gaussTable1D = [-1/sqrt(3), 1/sqrt(3)];
+
+for currElemNumber = 1:numElements
+
+    % Get the global coordinates of the nodes for a given element
+
+    % currElemeCoords is a 4x2 matrix where the global coordinates
+    % for node 1 is loacted in the first row, node 2's global coordinates
+    % are located in the second row, and so on and so forth
+    currElemCoords = nodes(elements(currElemNumber, 1:4), :);
+
+    % Element stiffness matrix
+    Ke = zeros(4,4);
+
+    % Local load vector
+    Re = zeros(4, 1);
+
+    for gaussPoint = 1:4
+        % Gauss coords in local coord system
+        zeta = gaussTable2D(gaussPoint, 1);    
+        eta = gaussTable2D(gaussPoint, 2);
+
+        % NMat is the shape function result for a given gauss point 
+        NMat = shape_function_calc(zeta, eta);
+
+        % Get the partial derivatives at the gauss points for each of the shape functions 
+        % dN_dzeta is a 4x1 matrix containing \frac{\partial N_i(zeta, eta)}{\partial zeta}
+        % dN_deta is a 4x1 matrix containing \frac{\partial N_i(zeta, eta)}{\partial eta}
+        [dN_dzeta, dN_deta] = shape_function_derivatives(zeta, eta);
+
+        % Get the Jacobian 
+        [J, detJ] = jacobian(currElemCoords, dN_dzeta, dN_deta);
+
+        % Get the partial derivatives of the shape functions with respect to x and y
+        % Since J = [dx/dzeta, dx/deta; dy/dzeta, dy/deta], the correct transformation is
+        % grad_xy = inv(J') * grad_zeta_eta.
+        dN_dxdy = J' \ [dN_dzeta'; dN_deta'];
+
+        % Assemble B matrix
+        dN_dx = dN_dxdy(1,:);
+        dN_dy = dN_dxdy(2,:);
+        B = [dN_dx; dN_dy];
+
+        % Calculate stiffness matrix
+        % Here we are doing gauss quadrature integration but you will notice there is no
+        % weights here and that is because for a 2-point gauss quad integration
+        % the weight is equal to 1
+        Ke = Ke + (B' * lambda * B * detJ * t);
+
+        % Calculate local load vector due to heat generation by the element
+        % We use the shape functions to determine how much of the distributed heat
+        % source should be assigned to each node 
+        Re = Re + (Q * NMat * detJ * t);
+    end
+
+    % Check if we need to impose heat fluxes on this element
+    nuclearFluxCheck = (elements(currElemNumber, 5) == 1);
+    radiationFluxCheck = (elements(currElemNumber, 5) == 2);
+
+    if (nuclearFluxCheck)
+        % Applied on the eta = -1 boundary. Eta = -1 corresponds with the line
+        % of an element that faces the reactor. Similarily to above we are going to use Gauss
+        % quadrature in order to intergrate the following:
+        % $$\{r\}_{q}=\int_{-1}^{1} q_{in}^{*}\{N(\zeta, \eta=-1)\}\sqrt{ \left( \frac{\partial x}{\partial \zeta} 
+        % \right)^{2}+\left( \frac{\partial y}{\partial \zeta} \right)^{2} } \, d \zeta $$
+
+        % Look to Chapter 5 Pt 2 Pages 18 and 19 for more info
+
+        for gaussPoint = 1:2 
+
+            % zeta first iter = -1/sqrt(3) and zeta second iter = 1/sqrt(3)
+            zeta = gaussTable1D(gaussPoint); 
+            eta = -1;
+
+            % Calculate the shape functions along the eta = -1 boundary
+            NMat = shape_function_calc(zeta, eta);
+
+            % Get the partial derivatives at the gauss points for each of the shape functions 
+            % dN_dzeta is a 4x1 matrix containing \frac{\partial N_i(zeta, eta)}{\partial zeta}
+            % dN_deta is a 4x1 matrix containing \frac{\partial N_i(zeta, eta)}{\partial eta}
+            [dN_dzeta, dN_deta] = shape_function_derivatives(zeta, eta);
+
+            % Get the Jacobian in order to get the partial derivatives with respect to zeta
+            [J, ~] = jacobian(currElemCoords, dN_dzeta, dN_deta);
+
+            % Calculate the local load vector and preform gauss-quadrature intergration
+            dx_dzeta_sq = J(1, 1) .^ 2;
+            dy_dzeta_sq = J(2, 1) .^ 2;
+            Re = Re + (qIn * NMat * sqrt(dx_dzeta_sq + dy_dzeta_sq) * t);
+        end
+    end
+
+    if (radiationFluxCheck)
+        % Applied on the eta = 1 boundary. Eta = 1 corresponds with the line
+        % of an element that faces outer space. This term is slightly different than the
+        % nuclear flux term because radiation depends on the surface temperature. To keep
+        % the problem linear, we use a linearized radiation condition:
+        %
+        % q_rad = hRad * (T - Tspace)
+        %
+        % This creates a contribution to both the element stiffness matrix and the element
+        % load vector:
+        %
+        % [K]rad = integral(hRad * {N}{N}^T * t * dGamma)
+        % {R}rad = integral(hRad * Tspace * {N} * t * dGamma)
+
+        for gaussPoint = 1:2
+            % zeta first iter = -1/sqrt(3) and zeta second iter = 1/sqrt(3)
+            zeta = gaussTable1D(gaussPoint); 
+            eta = 1;
+
+            % Calculate the shape functions along the eta = 1 boundary
+            NMat = shape_function_calc(zeta, eta);
+
+            % Get the partial derivatives at the gauss points for each of the shape functions 
+            % dN_dzeta is a 4x1 matrix containing \frac{\partial N_i(zeta, eta)}{\partial zeta}
+            % dN_deta is a 4x1 matrix containing \frac{\partial N_i(zeta, eta)}{\partial eta}
+            [dN_dzeta, dN_deta] = shape_function_derivatives(zeta, eta);
+
+            % Get the Jacobian in order to get the partial derivatives with respect to zeta
+            [J, ~] = jacobian(currElemCoords, dN_dzeta, dN_deta);
+
+            % Calculate the local radiation stiffness matrix and local radiation load vector
+            dx_dzeta_sq = J(1, 1) .^ 2;
+            dy_dzeta_sq = J(2, 1) .^ 2;
+            edgeJac = sqrt(dx_dzeta_sq + dy_dzeta_sq);
+
+            Ke = Ke + (hRad * (NMat * NMat') * edgeJac * t);
+            Re = Re + (hRad * Tspace * NMat * edgeJac * t);
+        end
+    end
+
+    % Get the number of each node for this element in the global system 
+    % Add its contribution to the global stiffness matrix for its particular nodes
+    % Add its contribution to the global load vector for its particular nodes
+    globalNodes = elements(currElemNumber,1:4);
+    K(globalNodes, globalNodes) = K(globalNodes, globalNodes) + Ke;
+    R(globalNodes) = R(globalNodes) + Re;
+end
+
+%% Solve Thermal System
+
+% Since the outer boundary uses a linearized radiation boundary condition, the system now has a
+% temperature reference through Tspace. Therefore, we do not need to prescribe fixed-temperature
+% nodes for this version of the model.
+
+T = K \ R;
+
+%% Post-Processing
+
+% Radius of each node
+nodeRadius = sqrt(nodes(:,1).^2 + nodes(:,2).^2);
+
+% Maximum and minimum temperatures
+[Tmax, idMax] = max(T);
+[Tmin, idMin] = min(T);
+deltaT = Tmax - Tmin;
+
+% Locations of max and min temperatures in km for plotting/reporting
+maxLocation_km = nodes(idMax,:) * plotScale;
+minLocation_km = nodes(idMin,:) * plotScale;
+
+% Heat flux calculation at the centroid of each element
+qElem = zeros(numElements, 2);
+qMag = zeros(numElements, 1);
+
+for currElemNumber = 1:numElements
+
+    % Get the element nodes and coordinates
+    currElemNodes = elements(currElemNumber, 1:4);
+    currElemCoords = nodes(currElemNodes, :);
+    currElemTemp = T(currElemNodes);
+
+    % Calculate heat flux at the element center
+    zeta = 0;
+    eta = 0;
+
+    % Get the shape function derivatives
+    [dN_dzeta, dN_deta] = shape_function_derivatives(zeta, eta);
+
+    % Get the Jacobian
+    [J, ~] = jacobian(currElemCoords, dN_dzeta, dN_deta);
+
+    % Get the partial derivatives of the shape functions with respect to x and y
+    % Since J = [dx/dzeta, dx/deta; dy/dzeta, dy/deta], the correct transformation is
+    % grad_xy = inv(J') * grad_zeta_eta.
+    dN_dxdy = J' \ [dN_dzeta'; dN_deta'];
+
+    % Assemble B matrix
+    dN_dx = dN_dxdy(1,:);
+    dN_dy = dN_dxdy(2,:);
+    B = [dN_dx; dN_dy];
+
+    % Temperature gradient and conductive heat flux
+    gradT = B * currElemTemp;
+    q = -lambda * gradT;
+
+    qElem(currElemNumber,:) = q';
+    qMag(currElemNumber) = norm(q);
+end
+
+% Maximum heat flux magnitude
+[qMax, idQmax] = max(qMag);
+
+% Estimated thermal strain
+thermalStrain = alpha * deltaT;
+
+% Radial temperature profile
+Tgrid = reshape(T, size(nodeID));
+Tmean_radial = mean(Tgrid, 2);
+Tmax_radial = max(Tgrid, [], 2);
+Tmin_radial = min(Tgrid, [], 2);
+r_km = r(:) * plotScale;
+
+%% Table 2
+
+% This table is exported as a csv file and also printed to the command window.
+% Use the table values in the final report's post-processing section.
+
+resultNames = [
+    "Maximum temperature";
+    "Minimum temperature";
+    "Radial temperature difference";
+    "Peak conductive heat flux";
+    "Estimated thermal strain"
+];
+
+symbols = [
+    "Tmax";
+    "Tmin";
+    "Delta T";
+    "|q|max";
+    "epsilon_th"
+];
+
+values = [
+    Tmax;
+    Tmin;
+    deltaT;
+    qMax;
+    thermalStrain
+];
+
+units = [
+    "K";
+    "K";
+    "K";
+    "W/m^2";
+    "-"
+];
+
+designMeaning = [
+    "Controls material and habitat temperature limits";
+    "Indicates coolest radiator-side region";
+    "Controls thermal expansion mismatch";
+    "Identifies strongest heat-flow path";
+    "Estimates unconstrained thermal expansion strain"
+];
+
+Table2 = table(resultNames, symbols, values, units, designMeaning);
+disp(Table2);
+
+writetable(Table2, 'Table2_post_processing.csv');
+
+%% Display Results in Command Window
+
+fprintf('\nPost-Processing Results\n');
+fprintf('Maximum temperature: %.4f K\n', Tmax);
+fprintf('Minimum temperature: %.4f K\n', Tmin);
+fprintf('Radial temperature difference: %.4f K\n', deltaT);
+fprintf('Peak conductive heat flux: %.4f W/m^2\n', qMax);
+fprintf('Estimated thermal strain: %.6e\n', thermalStrain);
+fprintf('Maximum temperature location: x = %.4f km, y = %.4f km\n', maxLocation_km(1), maxLocation_km(2));
+fprintf('Minimum temperature location: x = %.4f km, y = %.4f km\n', minLocation_km(1), minLocation_km(2));
+
+%% Figure 1: Geometry, Mesh, and Boundary Conditions
+
+% This figure is intended for the report. It removes node and element labels so that the
+% geometry, mesh, and boundary conditions are readable.
+
+innerNodes = nodeID(1, :).';
+outerNodes = nodeID(end, :).';
+
+innerLoop = [innerNodes; innerNodes(1)];
+outerLoop = [outerNodes; outerNodes(1)];
+
+figure;
+hold on;
+axis equal;
+grid on;
+
+% Plot all elements
+for currElemNumber = 1:numElements
+    
+    currElemNodes = elements(currElemNumber, 1:4);
+    coords = nodes(currElemNodes, :) * plotScale;
+    
+    % Close the quad for plotting
+    coords_closed = [coords; coords(1,:)];
+    
+    % Draw element
+    if (currElemNumber == 1)
+        hMesh = plot(coords_closed(:,1), coords_closed(:,2), 'k-', 'LineWidth', 0.5);
+    else
+        plot(coords_closed(:,1), coords_closed(:,2), 'k-', 'LineWidth', 0.5, ...
+            'HandleVisibility', 'off');
+    end
+end
+
+% Plot the reactor-facing boundary
+hInner = plot(nodes(innerLoop,1)*plotScale, nodes(innerLoop,2)*plotScale, ...
+    'LineWidth', 2.5);
+
+% Plot the radiating outer boundary
+hOuter = plot(nodes(outerLoop,1)*plotScale, nodes(outerLoop,2)*plotScale, ...
+    'LineWidth', 2.5);
+
+% Label central reactor
+text(0, 0, 'Central Reactor', ...
+    'HorizontalAlignment', 'center', ...
+    'FontWeight', 'bold');
+
+xlabel('X Position (km)');
+ylabel('Y Position (km)');
+title('Annular Habitat Mesh and Thermal Boundary Conditions');
+
+legend([hMesh, hInner, hOuter], ...
+       'Finite element mesh', ...
+       'Reactor-facing heat input boundary', ...
+       'Radiating outer boundary', ...
+       'Location', 'bestoutside');
+
+hold off
+
+exportgraphics(gcf, 'Figure1_geometry_mesh.svg', 'ContentType', 'vector');
+exportgraphics(gcf, 'Figure1_geometry_mesh.png', 'Resolution', 300);
+
+%% Figure 2: FEM Temperature Distribution
+
+% This figure is the primary FEM solution plot for the report.
+
+figure;
+hold on;
+axis equal;
+
+patch('Faces', elements(:,1:4), ...
+      'Vertices', nodes * plotScale, ...
+      'FaceVertexCData', T, ...
+      'FaceColor', 'interp', ...
+      'EdgeColor', 'none');
+
+% Plot inner and outer boundaries so that the annulus is clear
+plot(nodes(innerLoop,1)*plotScale, nodes(innerLoop,2)*plotScale, ...
+    'k-', 'LineWidth', 1.2);
+
+plot(nodes(outerLoop,1)*plotScale, nodes(outerLoop,2)*plotScale, ...
+    'k-', 'LineWidth', 1.2);
+
+% Mark max and min temperature nodes
+scatter(nodes(idMax,1)*plotScale, nodes(idMax,2)*plotScale, ...
+    60, 'filled', 'MarkerEdgeColor', 'k');
+
+scatter(nodes(idMin,1)*plotScale, nodes(idMin,2)*plotScale, ...
+    60, 'filled', 'MarkerEdgeColor', 'k');
+
+text(nodes(idMax,1)*plotScale, nodes(idMax,2)*plotScale, ...
+    sprintf('  Tmax = %.2f K', Tmax), ...
+    'FontWeight', 'bold');
+
+text(nodes(idMin,1)*plotScale, nodes(idMin,2)*plotScale, ...
+    sprintf('  Tmin = %.2f K', Tmin), ...
+    'FontWeight', 'bold');
+
+xlabel('X Position (km)');
+ylabel('Y Position (km)');
+title('FEM Temperature Distribution');
+
+cb = colorbar;
+ylabel(cb, 'Temperature (K)');
+
+hold off
+
+exportgraphics(gcf, 'Figure2_temperature_distribution.svg', 'ContentType', 'vector');
+exportgraphics(gcf, 'Figure2_temperature_distribution.png', 'Resolution', 300);
+
+%% Figure 3: Radial Temperature Profile
+
+% This figure reduces the full 2D temperature distribution into a radial profile.
+% The mean line shows the average temperature at each radial station, while the
+% max and min lines show whether the solution changes much around the ring.
+
+figure;
+hold on;
+grid on;
+
+plot(r_km, Tmean_radial, '-', 'LineWidth', 2);
+plot(r_km, Tmax_radial, '--', 'LineWidth', 1.2);
+plot(r_km, Tmin_radial, '--', 'LineWidth', 1.2);
+
+xlabel('Radius (km)');
+ylabel('Temperature (K)');
+title('Radial Temperature Profile');
+
+legend('Circumferential mean temperature', ...
+       'Maximum temperature at radius', ...
+       'Minimum temperature at radius', ...
+       'Location', 'best');
+
+text(r_km(1), Tmean_radial(1), ...
+    sprintf('  Inner wall: %.2f K', Tmean_radial(1)), ...
+    'FontWeight', 'bold');
+
+text(r_km(end), Tmean_radial(end), ...
+    sprintf('  Outer wall: %.2f K', Tmean_radial(end)), ...
+    'FontWeight', 'bold');
+
+hold off
+
+exportgraphics(gcf, 'Figure3_radial_temperature_profile.svg', 'ContentType', 'vector');
+exportgraphics(gcf, 'Figure3_radial_temperature_profile.png', 'Resolution', 300);
+
+%% Functions
+
+function result = shape_function_calc(zeta, eta)
+
+    % This function should be pretty self explanatory as it simply just calculates the shape
+    % functions at a particular zeta and eta.
+
+    % N_1(zeta, eta) = 1/4 * (1 - zeta) * (1 - eta) = 1/4 * (1 - zeta - eta + zeta*eta)
+    % N_2(zeta, eta) = 1/4 * (1 - zeta) * (1 + eta) = 1/4 * (1 - zeta + eta - zeta*eta)
+    % N_3(zeta, eta) = 1/4 * (1 + zeta) * (1 + eta) = 1/4 * (1 + zeta + eta + zeta*eta)
+    % N_4(zeta, eta) = 1/4 * (1 + zeta) * (1 - eta) = 1/4 * (1 + zeta - eta - zeta*eta)
+
+    N1 = 0.25 * (1 - zeta) * (1 - eta);
+    N2 = 0.25 * (1 - zeta) * (1 + eta);
+    N3 = 0.25 * (1 + zeta) * (1 + eta);
+    N4 = 0.25 * (1 + zeta) * (1 - eta);
+    
+    result = [N1; N2; N3; N4];
+end
+
+function [dN_dzeta, dN_deta] = shape_function_derivatives(zeta, eta)
+
+    % Above there is a section called shape functions which are the shape functions for each node in
+    % the 4-node quad. All I did in this section was take the derivative of each of those shape
+    % functions with respect to zeta and eta. Each index of dN_dzeta and dN_deta corresponds to the
+    % partial derivatives with respect to zeta and eta respectively. The first row is for node 1,
+    % the second row is for node 2, and so on and so forth. Look to Figure 1 to determine what nodes
+    % correspond with what location on the quad.
+
+    dN_dzeta = 1/4 * [
+        -(1 - eta)
+        -(1 + eta)
+         (1 + eta)
+         (1 - eta)
+    ];
+
+    dN_deta = 1/4 * [
+        -(1 - zeta)
+         (1 - zeta)
+         (1 + zeta)
+        -(1 + zeta)
+    ];
+end
+
+function [J, detJ] = jacobian(coords, dN_dzeta, dN_deta)
+    % coords: 4x2 matrix [x y]
+    J = zeros(2,2);
+    
+    %{
+    The Jacobian matrix is equal to:
+    J = [dx/dzeta, dx/deta; dy/dzeta, dy/deta] note that these are
+    all partial derivatives. If you remember, we can get the x and y loacations from
+    a given zeta and eta by using the mapping equation. 
+
+    x(zeta, eta) = \Sum_{i=1}^{M}x_i * N_i(zeta,eta) and y(zeta, eta)
+    y(zeta, eta) = \Sum_{i=1}^{M}y_i * N_i(zeta,eta)
+
+    Where x_i and y_i are the the global x and y locations of the node that N_i corresponds to and M
+    = 4 due to us using a 4-node quad.
+   
+    We can also get the partial derivates (like dx/dzeta and dy/deta). We do this by multiplying not
+    by the normal shape functions but their derivatives instead. For example, \frac{\partial
+    x}{\partial zeta} = \Sigma_{i=1}^{M}x_i * \frac{\partial N_i(zeta, eta)}{\partial zeta}. We get
+    these partial derivatives of these shape functions from the shape_function_derivatives function
+    above.
+    %}
+
+    for i = 1:4
+        J(1,1) = J(1,1) + dN_dzeta(i) * coords(i,1); % dx/dzeta
+        J(1,2) = J(1,2) + dN_deta(i)  * coords(i,1); % dx/deta
+        J(2,1) = J(2,1) + dN_dzeta(i) * coords(i,2); % dy/dzeta
+        J(2,2) = J(2,2) + dN_deta(i)  * coords(i,2); % dy/deta
+    end
+    
+    detJ = det(J);
+end
